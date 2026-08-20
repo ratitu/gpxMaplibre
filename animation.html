@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Track Animation</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='7' fill='none' stroke='white' stroke-width='2'/%3E%3Ccircle cx='8' cy='8' r='4' fill='%232ecc71'/%3E%3C/svg%3E">
+<link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet">
+<style>
+  html, body, #map { margin:0; padding:0; width:100%; height:100%; overflow:hidden; }
+  #chart {
+    position:absolute; left:16px; bottom:16px; width:360px; height:132px;
+    border-radius:6px; pointer-events:none; z-index:10;
+  }
+  #controls {
+    position:absolute; bottom:16px; left:50%; transform:translateX(-50%);
+    display:flex; align-items:center; gap:10px; padding:8px 14px;
+    background:rgba(0,0,0,0.55); border-radius:999px; z-index:10;
+    font-family:system-ui, sans-serif; pointer-events:auto;
+  }
+  #controls button {
+    background:none; border:none; color:#fff; font-size:14px; line-height:1;
+    padding:4px 8px; border-radius:999px; cursor:pointer;
+  }
+  #controls button:hover { background:rgba(255,255,255,0.15); }
+  #speed { display:flex; gap:2px; }
+  #speed button { font-size:12px; color:rgba(255,255,255,0.7); }
+  #speed button.active { background:rgba(255,255,255,0.25); color:#fff; }
+  #slider { width:220px; accent-color:#00ccbc; cursor:pointer; }
+  #load-error {
+    position:absolute; top:64px; left:50%; transform:translateX(-50%);
+    color:#ff5252; font:13px system-ui, sans-serif; z-index:10;
+    background:rgba(0,0,0,0.55); padding:6px 12px; border-radius:8px;
+  }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<canvas id="chart" width="720" height="264"></canvas>
+<div id="controls">
+  <button id="btn-play" title="Play/Pause">▶</button>
+  <button id="btn-reset" title="Reset">⏮</button>
+  <div id="speed">
+    <button data-speed="1" class="active">1×</button>
+    <button data-speed="2">2×</button>
+    <button data-speed="4">4×</button>
+  </div>
+  <input id="slider" type="range" min="0" max="1000" value="0">
+</div>
+<div id="load-error" style="display:none">erro ao carregar track.geojson</div>
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<script>
+(async () => {
+  'use strict';
+
+  // ---- same setup as index.html: Esri World Imagery + local SRTM terrain ----
+  const style = {
+    version: 8,
+    sources: {
+      'esri-sat': {
+        type: 'raster',
+        tiles: ['https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'],
+        tileSize: 256,
+        maxzoom: 19,
+        attribution: 'Tiles © Esri — Source: Esri, Maxar, Earthstar Geographics, and the GIS User Community'
+      }
+    },
+    layers: [{ id: 'esri-sat-bg', type: 'raster', source: 'esri-sat' }]
+  };
+
+  const ZOOM = 15, PITCH = 60, BEARING = 18;
+
+  const map = new maplibregl.Map({
+    container: 'map',
+    style: style,
+    center: [-46.488, -23.182],
+    zoom: 13.2,
+    pitch: PITCH,
+    bearing: BEARING,
+    maxPitch: 85,
+    canvasContextAttributes: { preserveDrawingBuffer: true },
+    attributionControl: { compact: true }
+  });
+  window.__map = map;
+
+  // ---- elevation ramp (dynamic: 9 colors evenly spaced over [lo,hi], bounds set after track load) ----
+  const RAMP_COLORS = ['#2c7bb6','#00a6ca','#00ccbc','#90eb9d','#ffff8c','#f9d057','#f29e2e','#e76818','#d7191c'];
+  let RAMP_LO = 0, RAMP_HI = 1;
+  function hex(c) { return '#' + [c[0],c[1],c[2]].map(v => Math.round(v).toString(16).padStart(2,'0')).join(''); }
+  function rampColor(ele) {
+    if (ele <= RAMP_LO) return RAMP_COLORS[0];
+    if (ele >= RAMP_HI) return RAMP_COLORS[RAMP_COLORS.length - 1];
+    const pos = (ele - RAMP_LO) / (RAMP_HI - RAMP_LO) * (RAMP_COLORS.length - 1);
+    const k = Math.min(Math.floor(pos), RAMP_COLORS.length - 2);
+    const t = pos - k;
+    const c0 = RAMP_COLORS[k], c1 = RAMP_COLORS[k + 1];
+    const p0 = [parseInt(c0.slice(1,3),16), parseInt(c0.slice(3,5),16), parseInt(c0.slice(5,7),16)];
+    const p1 = [parseInt(c1.slice(1,3),16), parseInt(c1.slice(3,5),16), parseInt(c1.slice(5,7),16)];
+    return hex([p0[0]+(p1[0]-p0[0])*t, p0[1]+(p1[1]-p0[1])*t, p0[2]+(p1[2]-p0[2])*t]);
+  }
+
+  const chart = document.getElementById('chart');
+  const ctx = chart.getContext('2d');
+
+  const anim = {
+    coords: null,      // [[lon,lat,ele], ...]
+    cumDist: null,     // cumulative haversine distance per point (m)
+    distFrac: null,    // cumDist / total
+    totalDist: 0,
+    eleMin: Infinity, eleMax: -Infinity,
+    lastIndex: 0,
+    ready: null,
+    setFrame: null
+  };
+
+  map.on('load', () => {
+    map.addSource('dem', {
+      type: 'raster-dem',
+      tiles: ['terrain_tiles/{z}/{x}/{y}.png'],
+      encoding: 'terrarium',
+      tileSize: 256,
+      minzoom: 9,
+      maxzoom: 15
+    });
+    map.setTerrain({ source: 'dem', exaggeration: 1.3 });
+    map.setSky({ 'sky-color': '#0b1c2c', 'sky-horizon-blend': 0.6, 'horizon-color': '#e8f2ff', 'fog-color': '#cfe0f2' });
+
+    fetch('track.geojson')
+      .then(r => r.json())
+      .then(gj => {
+        const coords = gj.features[0].geometry.coordinates; // [lon,lat,ele]
+        const N = coords.length;
+        const R = 6371000;
+        const cum = [0];
+        for (let i = 1; i < N; i++) {
+          const lon1 = coords[i-1][0], lat1 = coords[i-1][1];
+          const lon2 = coords[i][0], lat2 = coords[i][1];
+          const dLat = (lat2-lat1)*Math.PI/180, dLon = (lon2-lon1)*Math.PI/180;
+          const a = Math.sin(dLat/2)**2 + Math.cos(lat1*Math.PI/180)*Math.cos(lat2*Math.PI/180)*Math.sin(dLon/2)**2;
+          cum.push(cum[i-1] + 2*R*Math.asin(Math.sqrt(a)));
+        }
+        anim.coords = coords;
+        anim.cumDist = cum;
+        anim.totalDist = cum[N-1];
+        anim.distFrac = cum.map(d => d / cum[N-1]);
+        for (let i = 0; i < N; i++) {
+          if (coords[i][2] < anim.eleMin) anim.eleMin = coords[i][2];
+          if (coords[i][2] > anim.eleMax) anim.eleMax = coords[i][2];
+        }
+
+        // ---- dynamic ramp bounds: round to 50 m steps (this track: 750–1200) ----
+        RAMP_LO = Math.floor(anim.eleMin / 50) * 50;
+        RAMP_HI = Math.ceil(anim.eleMax / 50) * 50;
+        if (RAMP_HI <= RAMP_LO) RAMP_HI = RAMP_LO + 1;
+
+        // ---- gradient stops from elevation buckets (same logic as index.html) ----
+        const stops = [];
+        let lastBucket = null;
+        for (let i = 0; i < N; i++) {
+          const fr = anim.distFrac[i];
+          const bucket = Math.round(coords[i][2] / 25);
+          if (i === 0 || bucket !== lastBucket) {
+            stops.push([fr, rampColor(coords[i][2])]);
+            lastBucket = bucket;
+          }
+        }
+        stops[0][0] = 0;
+        stops[stops.length-1][0] = 1;
+        const gradStops = [];
+        for (const s of stops) gradStops.push(s[0], s[1]);
+
+        // ---- sources & layers ----
+        map.addSource('track-full', { type: 'geojson', data: { type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: coords } } });
+        map.addSource('trail', { type: 'geojson', data: { type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: [coords[0], coords[0]] } }, lineMetrics: true });
+        map.addSource('pos', { type: 'geojson', data: { type: 'Feature', properties: {}, geometry: { type: 'Point', coordinates: coords[0] } } });
+
+        // dimmed full track (gpxAnimator: dim_color 0.35 toward white)
+        map.addLayer({ id: 'track-full', type: 'line', source: 'track-full',
+          paint: { 'line-color': '#ffffff', 'line-opacity': 0.30, 'line-width': 3 } });
+
+        // growing trail, elevation-colored via line-gradient
+        map.addLayer({ id: 'trail-line', type: 'line', source: 'trail',
+          paint: { 'line-width': 4, 'line-opacity': 0.95, 'line-blur': 0.4,
+                    'line-gradient': ['interpolate', ['linear'], ['line-progress']].concat(gradStops) } });
+
+        // position marker: white halo under colored core (gpxAnimator style)
+        map.addLayer({ id: 'pos-halo', type: 'circle', source: 'pos',
+          paint: { 'circle-radius': 10, 'circle-color': '#ffffff', 'circle-opacity': 0.95, 'circle-stroke-width': 0 } });
+        map.addLayer({ id: 'pos-core', type: 'circle', source: 'pos',
+          paint: { 'circle-radius': 6, 'circle-color': rampColor(coords[0][2]), 'circle-stroke-width': 0 } });
+
+        // ---- elevation mini-chart (gpxAnimator overlay, bottom-left) ----
+        function drawChart(i) {
+          const W = chart.width, H = chart.height;
+          const padL = 8, padR = 8, padT = 10, padB = 22;
+          const cw = W - padL - padR, ch = H - padT - padB;
+          ctx.clearRect(0, 0, W, H);
+          ctx.fillStyle = 'rgba(0,0,0,0.55)';
+          ctx.beginPath();
+          ctx.roundRect(0, 0, W, H, 8);
+          ctx.fill();
+          const elMin = anim.eleMin, elMax = anim.eleMax;
+          const span = (elMax - elMin) || 1;
+          function yOf(ele) { return padT + ch - (ele - elMin) / span * ch; }
+          function xOf(frac) { return padL + frac * cw; }
+          // full profile dimmed
+          ctx.strokeStyle = 'rgba(255,255,255,0.35)';
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          for (let k = 0; k < anim.coords.length; k++) {
+            const x = xOf(anim.distFrac[k]), y = yOf(anim.coords[k][2]);
+            if (k === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+          }
+          ctx.stroke();
+          // traveled portion in current elevation color
+          ctx.strokeStyle = rampColor(anim.coords[i][2]);
+          ctx.lineWidth = 3;
+          ctx.beginPath();
+          for (let k = 0; k <= i; k++) {
+            const x = xOf(anim.distFrac[k]), y = yOf(anim.coords[k][2]);
+            if (k === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+          }
+          ctx.stroke();
+          // current point dot
+          ctx.fillStyle = '#ffffff';
+          ctx.beginPath();
+          ctx.arc(xOf(anim.distFrac[i]), yOf(anim.coords[i][2]), 4, 0, Math.PI * 2);
+          ctx.fill();
+          // label
+          ctx.fillStyle = '#ffffff';
+          ctx.font = '12px sans-serif';
+          ctx.textAlign = 'left';
+          const km = (anim.cumDist[i] / 1000).toFixed(1);
+          ctx.fillText(km + 'km ' + Math.round(anim.coords[i][2]) + 'm', padL, H - 6);
+          // end label
+          ctx.textAlign = 'right';
+          ctx.fillStyle = 'rgba(255,255,255,0.7)';
+          ctx.fillText((anim.totalDist / 1000).toFixed(1) + 'km', W - padR, H - 6);
+        }
+
+        // ---- the animation engine ----
+        anim.setFrame = function (f) {
+          const N = anim.coords.length;
+          let i = Math.round(f * (N - 1));
+          if (i < 0) i = 0;
+          if (i > N - 1) i = N - 1;
+          anim.lastIndex = i;
+          const coords = anim.coords;
+          // growing trail
+          map.getSource('trail').setData({
+            type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: coords.slice(0, i + 1) }
+          });
+          // position marker
+          map.getSource('pos').setData({
+            type: 'Feature', properties: {}, geometry: { type: 'Point', coordinates: coords[i] }
+          });
+          map.setPaintProperty('pos-core', 'circle-color', rampColor(coords[i][2]));
+          // follow camera
+          map.jumpTo({ center: [coords[i][0], coords[i][1]], zoom: ZOOM, pitch: PITCH, bearing: BEARING });
+          // chart
+          drawChart(i);
+          return i;
+        };
+
+        // first frame + expose
+        anim.setFrame(0);
+        window.__anim = anim;
+        anim.ready = Promise.resolve(true);
+      })
+      .catch(err => {
+        console.error('animation init failed:', err);
+        anim.ready = Promise.reject(err);
+      });
+  });
+})();
+</script>
+</body>
+</html>

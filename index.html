@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Bom Jesus dos Perdões – GPX 3D</title>
+<link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet" />
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; }
+  #map { position: absolute; inset: 0; }
+
+  #legend {
+    position: absolute; bottom: 30px; left: 12px; z-index: 10;
+    background: rgba(255,255,255,.92); border-radius: 8px; padding: 10px 12px;
+    font: 12px/1.4 system-ui, sans-serif; color: #222;
+    box-shadow: 0 1px 6px rgba(0,0,0,.25); pointer-events: none;
+  }
+  #legend h1 { margin: 0 0 6px; font-size: 13px; font-weight: 600; }
+  #grad {
+    width: 180px; height: 10px; border-radius: 5px; margin: 6px 0 4px;
+    background: linear-gradient(to right,
+      #2c7bb6, #00a6ca, #00ccbc, #90eb9d, #ffff8c, #f9d057, #f29e2e, #e76818, #d7191c);
+  }
+  #scale { display: flex; justify-content: space-between; font-size: 11px; color: #555; }
+  #stats { margin-top: 6px; font-size: 11px; color: #444; }
+  #stats b { color: #222; }
+  #stats .up { color: #16a34a; }
+  #stats .down { color: #dc2626; }
+
+  #load-error {
+    position: absolute; top: 12px; left: 50%; transform: translateX(-50%); z-index: 20;
+    background: #dc2626; color: #fff; font: 13px/1.4 system-ui, sans-serif;
+    padding: 8px 16px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,.35);
+  }
+
+  #exag {
+    position: absolute; top: 12px; left: 12px; z-index: 10;
+    background: rgba(255,255,255,.92); border-radius: 8px; padding: 8px 10px;
+    font: 12px system-ui, sans-serif; color: #222;
+    box-shadow: 0 1px 6px rgba(0,0,0,.25);
+  }
+  #exag label { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; }
+  #exag output { font-weight: 600; }
+  #exag input { width: 130px; accent-color: #0e7490; }
+
+  #profile {
+    position: absolute; bottom: 14px; left: 50%; transform: translateX(-50%); z-index: 10;
+    background: rgba(17,24,39,.85); border-radius: 10px; padding: 8px;
+    box-shadow: 0 2px 10px rgba(0,0,0,.4);
+    font: 11px/1.3 system-ui, sans-serif; color: #fff;
+  }
+  #profile[hidden] { display: none; }
+  #profile canvas { display: block; cursor: crosshair; }
+  #profile-hint { text-align: center; opacity: .7; margin-top: 4px; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="load-error" hidden>Falha ao carregar os dados do percurso.</div>
+
+<div id="exag">
+  <label>Relevo <output id="exag-val">1.3</output>×</label>
+  <input id="exag-range" type="range" min="0.5" max="3" step="0.1" value="1.3" />
+</div>
+
+<div id="legend">
+  <h1>Elevação (m)</h1>
+  <div id="grad"></div>
+  <div id="scale"><span>—</span><span>—</span><span>—</span></div>
+  <div id="stats">carregando…</div>
+</div>
+
+<div id="profile" hidden>
+  <canvas id="profile-canvas" width="720" height="264"></canvas>
+  <div id="profile-hint">passe o mouse sobre o perfil</div>
+</div>
+
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<script>
+(async () => {
+  // Esri World Imagery satellite basemap (raster tiles) + local SRTM terrain
+  const style = {
+    version: 8,
+    glyphs: 'https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf',
+    sources: {
+      'esri-sat': {
+        type: 'raster',
+        tiles: ['https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'],
+        tileSize: 256,
+        maxzoom: 19,
+        attribution: 'Tiles © Esri — Source: Esri, Maxar, Earthstar Geographics, and the GIS User Community'
+      }
+    },
+    layers: [
+      { id: 'esri-sat-bg', type: 'raster', source: 'esri-sat' }
+    ]
+  };
+
+  const map = new maplibregl.Map({
+    container: 'map',
+    style,
+    center: [-46.488, -23.182],
+    zoom: 13.2,
+    pitch: 60,
+    bearing: 18,
+    maxPitch: 85,
+    attributionControl: { compact: true }
+  });
+  window.__map = map;
+
+  map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), 'top-right');
+  map.addControl(new maplibregl.ScaleControl({ maxWidth: 120, unit: 'metric' }), 'bottom-right');
+
+  const elError = document.getElementById('load-error');
+  const fail = msg => {
+    elError.hidden = false;
+    elError.textContent = msg;
+    console.error(msg);
+  };
+
+  map.on('load', async () => {
+    // --- local terrain (terrarium-encoded SRTM tiles) ---
+    map.addSource('dem', {
+      type: 'raster-dem',
+      tiles: ['terrain_tiles/{z}/{x}/{y}.png'],
+      encoding: 'terrarium',
+      tileSize: 256,
+      minzoom: 9,
+      maxzoom: 15
+    });
+    map.setTerrain({ source: 'dem', exaggeration: 1.3 });
+    map.setSky({ 'sky-color': '#0b1c2c', 'sky-horizon-blend': 0.6, 'horizon-color': '#e8f2ff', 'fog-color': '#cfe0f2' });
+
+    // --- GPX track ---
+    let geojson, coords;
+    try {
+      const resp = await fetch('track.geojson');
+      if (!resp.ok) throw new Error('HTTP ' + resp.status);
+      geojson = await resp.json();
+      coords = geojson.features[0].geometry.coordinates; // [lon, lat, ele]
+    } catch (e) {
+      fail('Falha ao carregar track.geojson — inicie um servidor HTTP local.');
+      return;
+    }
+
+    // --- elevation color ramp, adaptive to the track's own min/max (rounded to 50 m) ---
+    const eles = coords.map(c => c[2]);
+    const eleMin = Math.min(...eles), eleMax = Math.max(...eles);
+    const lo = Math.floor(eleMin / 50) * 50;
+    const hi = Math.ceil(eleMax / 50) * 50;
+    const RAMP_COLORS = ['#2c7bb6', '#00a6ca', '#00ccbc', '#90eb9d', '#ffff8c', '#f9d057', '#f29e2e', '#e76818', '#d7191c'];
+    const RAMP = RAMP_COLORS.map((c, i) => [lo + (hi - lo) * i / (RAMP_COLORS.length - 1), c]);
+    const hex = c => [parseInt(c.slice(1, 3), 16), parseInt(c.slice(3, 5), 16), parseInt(c.slice(5, 7), 16)];
+    const rampColor = e => {
+      const x = Math.min(Math.max(e, lo), hi); // clamp: no extrapolation past ramp ends
+      for (let i = 0; i < RAMP.length - 1; i++) {
+        const [e0, c0] = RAMP[i], [e1, c1] = RAMP[i + 1];
+        if (x <= e1) {
+          const t = (x - e0) / (e1 - e0);
+          const a = hex(c0), b = hex(c1);
+          const rgb = a.map((v, k) => Math.round(v + (b[k] - v) * t));
+          return '#' + rgb.map(v => v.toString(16).padStart(2, '0')).join('');
+        }
+      }
+      return RAMP[RAMP.length - 1][1];
+    };
+
+    // gradient stops: fraction along line (by length) -> color by elevation.
+    // maplibre v4 dropped ["coordinate", 2], so line-gradient + line-progress is used.
+    const dist = (a, b) => {
+      const R = 6371000, dLat = (b[1] - a[1]) * Math.PI / 180, dLon = (b[0] - a[0]) * Math.PI / 180;
+      const s = Math.sin(dLat / 2) ** 2 + Math.cos(a[1] * Math.PI / 180) * Math.cos(b[1] * Math.PI / 180) * Math.sin(dLon / 2) ** 2;
+      return 2 * R * Math.asin(Math.sqrt(s));
+    };
+    const cum = [0];
+    for (let i = 1; i < coords.length; i++) cum.push(cum[i - 1] + dist(coords[i - 1], coords[i]));
+    const total = cum[cum.length - 1] || 1;
+
+    // add a stop whenever the elevation bucket (25 m) changes, plus endpoints
+    const stops = [];
+    let lastBucket = null;
+    for (let i = 0; i < coords.length; i++) {
+      const f = cum[i] / total;
+      const bucket = Math.round(coords[i][2] / 25);
+      if (bucket !== lastBucket || i === 0 || i === coords.length - 1) {
+        stops.push([Math.min(Math.max(f, 0), 1), rampColor(coords[i][2])]);
+        lastBucket = bucket;
+      }
+    }
+    stops[0][0] = 0;
+    stops[stops.length - 1][0] = 1;
+
+    map.addSource('track', { type: 'geojson', data: geojson, lineMetrics: true });
+
+    // white casing keeps the elevation-colored line readable over imagery
+    map.addLayer({
+      id: 'track-casing', type: 'line', source: 'track',
+      layout: { 'line-cap': 'round', 'line-join': 'round' },
+      paint: { 'line-width': 7, 'line-color': '#ffffff', 'line-opacity': 0.55 }
+    });
+    map.addLayer({
+      id: 'track-line', type: 'line', source: 'track',
+      layout: { 'line-cap': 'round', 'line-join': 'round' },
+      paint: {
+        'line-width': 4, 'line-opacity': 0.95, 'line-blur': 0.4,
+        'line-gradient': ['interpolate', ['linear'], ['line-progress'], ...stops.flat()]
+      }
+    });
+
+    // --- km markers: interpolate a point every full kilometre along the track ---
+    const kmFeatures = [];
+    const KM = 1000;
+    for (let d = KM; d < total - 50; d += KM) {
+      let i = 1;
+      while (i < cum.length - 1 && cum[i] < d) i++;
+      const t = (d - cum[i - 1]) / (cum[i] - cum[i - 1] || 1);
+      const a = coords[i - 1], b = coords[i];
+      kmFeatures.push({
+        type: 'Feature',
+        geometry: { type: 'Point', coordinates: [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t] },
+        properties: { km: Math.round(d / KM) }
+      });
+    }
+    map.addSource('km', { type: 'geojson', data: { type: 'FeatureCollection', features: kmFeatures } });
+    map.addLayer({
+      id: 'km-dot', type: 'circle', source: 'km',
+      paint: { 'circle-radius': 3.5, 'circle-color': '#ffffff', 'circle-stroke-width': 1, 'circle-stroke-color': 'rgba(0,0,0,.6)' }
+    });
+    map.addLayer({
+      id: 'km-label', type: 'symbol', source: 'km',
+      layout: {
+        'text-field': ['concat', ['to-string', ['get', 'km']], ' km'],
+        'text-font': ['Noto Sans Regular'],
+        'text-size': 11,
+        'text-offset': [0, 1.5],
+        'text-anchor': 'top'
+      },
+      paint: {
+        'text-color': '#ffffff',
+        'text-halo-color': 'rgba(0,0,0,.7)',
+        'text-halo-width': 1.2
+      }
+    });
+
+    // --- start / end markers ---
+    const first = coords[0], last = coords[coords.length - 1];
+    map.addSource('ends', {
+      type: 'geojson',
+      data: {
+        type: 'FeatureCollection',
+        features: [
+          { type: 'Feature', geometry: { type: 'Point', coordinates: first }, properties: { kind: 'start' } },
+          { type: 'Feature', geometry: { type: 'Point', coordinates: last },  properties: { kind: 'end' } }
+        ]
+      }
+    });
+    map.addLayer({
+      id: 'marker-start', type: 'circle', source: 'ends',
+      filter: ['==', ['get', 'kind'], 'start'],
+      paint: { 'circle-radius': 7, 'circle-color': '#16a34a', 'circle-stroke-width': 2.5, 'circle-stroke-color': '#ffffff' }
+    });
+    map.addLayer({
+      id: 'marker-end', type: 'circle', source: 'ends',
+      filter: ['==', ['get', 'kind'], 'end'],
+      paint: { 'circle-radius': 7, 'circle-color': '#dc2626', 'circle-stroke-width': 2.5, 'circle-stroke-color': '#ffffff' }
+    });
+
+    // --- hover position marker (driven by the elevation profile) ---
+    map.addSource('hover-pos', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
+    map.addLayer({
+      id: 'hover-ring', type: 'circle', source: 'hover-pos',
+      paint: { 'circle-radius': 8, 'circle-color': 'rgba(255,255,255,.85)', 'circle-stroke-width': 1.5, 'circle-stroke-color': 'rgba(0,0,0,.5)' }
+    });
+    map.addLayer({
+      id: 'hover-core', type: 'circle', source: 'hover-pos',
+      paint: {
+        'circle-radius': 4.5,
+        'circle-color': ['interpolate', ['linear'], ['get', 'ele'], ...RAMP.flat()],
+        'circle-stroke-width': 0
+      }
+    });
+
+    // --- elevation profile (hover to scrub along the track) ---
+    const cvs = document.getElementById('profile-canvas');
+    const ctx = cvs.getContext('2d');
+    const W = cvs.width, H = cvs.height, PAD = 8;
+    document.getElementById('profile').hidden = false;
+
+    const drawProfile = (hoverIdx = -1) => {
+      ctx.clearRect(0, 0, W, H);
+      const yOf = e => PAD + (1 - (e - eleMin) / (eleMax - eleMin || 1)) * (H - 2 * PAD);
+      const xOf = i => cum[i] / total * (W - 2 * PAD) + PAD;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      for (let i = 1; i < coords.length; i++) {
+        ctx.strokeStyle = rampColor((coords[i - 1][2] + coords[i][2]) / 2);
+        ctx.lineWidth = 2.2;
+        ctx.beginPath();
+        ctx.moveTo(xOf(i - 1), yOf(coords[i - 1][2]));
+        ctx.lineTo(xOf(i), yOf(coords[i][2]));
+        ctx.stroke();
+      }
+      // baseline
+      ctx.strokeStyle = 'rgba(255,255,255,.3)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(PAD, yOf(eleMin));
+      ctx.lineTo(W - PAD, yOf(eleMin));
+      ctx.stroke();
+      if (hoverIdx >= 0) {
+        const hx = xOf(hoverIdx), hy = yOf(coords[hoverIdx][2]);
+        ctx.strokeStyle = '#fff';
+        ctx.lineWidth = 1;
+        ctx.setLineDash([4, 3]);
+        ctx.beginPath(); ctx.moveTo(hx, PAD); ctx.lineTo(hx, H - PAD); ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = '#fff';
+        ctx.beginPath(); ctx.arc(hx, hy, 4, 0, Math.PI * 2); ctx.fill();
+        const label = `${(cum[hoverIdx] / 1000).toLocaleString('pt-BR', { maximumFractionDigits: 1 })} km · ${Math.round(coords[hoverIdx][2])} m`;
+        ctx.font = 'bold 12px system-ui, sans-serif';
+        const tw = ctx.measureText(label).width;
+        const lx = Math.min(Math.max(hx - tw / 2, 6), W - tw - 6);
+        const ly = (hy - 14 < 20) ? hy + 22 : hy - 14;
+        ctx.fillStyle = 'rgba(17,17,17,.8)';
+        ctx.beginPath();
+        ctx.roundRect(lx - 5, ly - 13, tw + 10, 19, 4);
+        ctx.fill();
+        ctx.fillStyle = '#fff';
+        ctx.fillText(label, lx, ly);
+      }
+    };
+
+    const updateHoverMarker = idx => {
+      map.getSource('hover-pos').setData(idx >= 0
+        ? { type: 'FeatureCollection', features: [{ type: 'Feature', geometry: { type: 'Point', coordinates: coords[idx] }, properties: { ele: coords[idx][2] } }] }
+        : { type: 'FeatureCollection', features: [] });
+    };
+
+    cvs.addEventListener('mousemove', e => {
+      const r = cvs.getBoundingClientRect();
+      const target = (e.clientX - r.left) / r.width * total;
+      let a = 0, b = cum.length - 1;
+      while (a < b - 1) { const m = (a + b) >> 1; if (cum[m] < target) a = m; else b = m; }
+      const idx = Math.abs(cum[a] - target) < Math.abs(cum[b] - target) ? a : b;
+      updateHoverMarker(idx);
+      drawProfile(idx);
+    });
+    cvs.addEventListener('mouseleave', () => {
+      updateHoverMarker(-1);
+      drawProfile(-1);
+    });
+    drawProfile();
+
+    // --- terrain exaggeration control ---
+    const elRange = document.getElementById('exag-range');
+    const elVal = document.getElementById('exag-val');
+    elRange.addEventListener('input', () => {
+      const v = parseFloat(elRange.value);
+      elVal.textContent = v.toFixed(1);
+      map.setTerrain({ source: 'dem', exaggeration: v });
+    });
+
+    // fit camera to track
+    const b = geojson.features[0].bbox || (() => {
+      const xs = coords.map(c => c[0]), ys = coords.map(c => c[1]);
+      return [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)];
+    })();
+    map.fitBounds([[b[0], b[1]], [b[2], b[3]]], { padding: 60, pitch: 60, bearing: 18, duration: 2000 });
+
+    // --- real stats: distance, cumulative ascent/descent, duration (from GPX timestamps) ---
+    let ascent = 0, descent = 0;
+    for (let i = 1; i < eles.length; i++) {
+      const d = eles[i] - eles[i - 1];
+      if (d > 0) ascent += d; else descent -= d;
+    }
+    let durationSec = null;
+    try {
+      const gpxResp = await fetch('bomJesusPerdoes.gpx');
+      if (gpxResp.ok) {
+        const gpxText = await gpxResp.text();
+        const stamps = [...gpxText.matchAll(/<time>([^<]+)<\/time>/g)].map(m => Date.parse(m[1])).filter(t => !isNaN(t));
+        // the file may open with a metadata timestamp (device end time) before the
+        // trackpoints, so use the span of all stamps rather than first/last occurrence
+        if (stamps.length >= 2) durationSec = (Math.max(...stamps) - Math.min(...stamps)) / 1000;
+      }
+    } catch (e) { /* duration stays unknown */ }
+
+    const fmtKm = m => (m / 1000).toLocaleString('pt-BR', { maximumFractionDigits: 1 });
+    const fmtDur = s => {
+      if (s == null || s < 0) return '—';
+      const h = Math.floor(s / 3600), m = Math.round((s % 3600) / 60);
+      if (h === 0) return `${m} min`;
+      return `${h}h ${String(m).padStart(2, '0')}min`;
+    };
+
+    document.getElementById('stats').innerHTML =
+      `<b>${coords.length.toLocaleString('pt-BR')}</b> pontos · ` +
+      `<b>${fmtKm(total)} km</b> · ` +
+      `<span class="up">▲ <b>${Math.round(ascent).toLocaleString('pt-BR')} m</b></span> subida · ` +
+      `<span class="down">▼ <b>${Math.round(descent).toLocaleString('pt-BR')} m</b></span> descida · ` +
+      `min <b>${Math.round(eleMin)} m</b> · max <b>${Math.round(eleMax)} m</b> · ` +
+      `duração <b>${fmtDur(durationSec)}</b>`;
+
+    // legend scale labels match the adaptive ramp
+    document.getElementById('scale').innerHTML =
+      `<span>${lo}</span><span>${Math.round((lo + hi) / 2)}</span><span>${hi}</span>`;
+  });
+})().catch(e => console.error('init failed:', e));
+</script>
+</body>
+</html>

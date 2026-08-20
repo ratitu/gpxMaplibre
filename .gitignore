@@ -1,0 +1,11 @@
+# Generated / downloaded data
+srtm_src/
+srtm_merged.tif
+terrain_tiles/
+gpx_animation.mp4
+*.pyc
+__pycache__/
+
+# Local tooling state
+.codegraph
+.omo/
